@@ -1,0 +1,189 @@
+diff -ruN rd-pristine/apt/BUILD.bazel rules_distroless-01bb79d7eef4eb3ce9511d3dfaf0ab386bd8d12d/apt/BUILD.bazel
+--- a/apt/BUILD.bazel	2026-07-29 19:08:26.000000000 +0100
++++ b/apt/BUILD.bazel	2026-09-08 14:56:30.717174536 +0100
+@@ -1,9 +1,24 @@
+ load("@bazel_lib//:bzl_library.bzl", "bzl_library")
++load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
+ 
+ exports_files([
+     "extensions.bzl",
+ ])
+ 
++# Whether the cc_library generated for an apt package keeps the absolute
++# `-Wl,-rpath=` entry naming each directory the package puts a library in.
++bool_flag(
++    name = "runtime_rpath",
++    build_setting_default = True,
++    visibility = ["//visibility:public"],
++)
++
++config_setting(
++    name = "no_runtime_rpath",
++    flag_values = {":runtime_rpath": "False"},
++    visibility = ["//visibility:public"],
++)
++
+ bzl_library(
+     name = "defs",
+     srcs = ["defs.bzl"],
+diff -ruN rd-pristine/apt/private/deb_import.bzl rules_distroless-01bb79d7eef4eb3ce9511d3dfaf0ab386bd8d12d/apt/private/deb_import.bzl
+--- a/apt/private/deb_import.bzl	2026-07-29 19:08:26.000000000 +0100
++++ b/apt/private/deb_import.bzl	2026-09-08 14:57:04.219988839 +0100
+@@ -120,6 +120,33 @@
+ )
+ """
+ 
++# The setting that decides whether a generated cc_library keeps its absolute paths.
++_NO_RUNTIME_RPATH = str(Label("//apt:no_runtime_rpath"))
++
++def render_linkopts(linkopts, rpath_linkopts):
++    """The source text for a linkopts attribute.
++
++    Args:
++        linkopts: the options that apply however the build is configured.
++        rpath_linkopts: the `-Wl,-rpath=` options, left out when `//apt:runtime_rpath` is off.
++
++    Returns:
++        A string holding the rendered expression for the linkopts (possibly a `select`).
++    """
++    deduplicated_linkopts = {opt: True for opt in linkopts}.keys()
++    if not rpath_linkopts:
++        return str(deduplicated_linkopts)
++
++    deduplicated_rpaths = {opt: True for opt in rpath_linkopts}.keys()
++    return """{linkopts} + select({{
++      "{runtime_rpath_config}": [],
++      "//conditions:default": {rpaths}
++    }})""".format(
++        linkopts = deduplicated_linkopts,
++        runtime_rpath_config = _NO_RUNTIME_RPATH,
++        rpaths = deduplicated_rpaths,
++    )
++
+ def resolve_symlink(target_path, relative_symlink):
+     # Split paths into components
+     target_parts = target_path.split("/")
+@@ -374,7 +401,7 @@
+                         "external/.." + include: True
+                         for include in includes + ["/usr/include", "/usr/include/x86_64-linux-gnu"]
+                     }.keys(),
+-                    linkopts = pkgc.linkopts,
++                    linkopts = render_linkopts(pkgc.linkopts, pkgc.rpath_linkopts),
+                 )
+ 
+         build_file_content += _CC_LIBRARY_TMPL.format(
+@@ -382,9 +409,8 @@
+             hdrs = h_files + hpp_files,
+             additional_compiler_inputs = hpp_files_woext,
+             additional_linker_inputs = so_files + o_files,
+-            linkopts = {
+-                opt: True
+-                for opt in [
++            linkopts = render_linkopts(
++                [
+                     # # Needed for cc_test binaries to locate its dependencies.
+                     # "-Wl,-rpath=../{}/{}".format(rctx.attr.name, rpath)
+                     # for rp in rpaths
+@@ -395,11 +421,12 @@
+                 ] + [
+                     "-L$(BINDIR)/external/{}/{}".format(rctx.attr.name, lp)
+                     for lp in link_paths
+-                ] + [
++                ] + remap_linkopts,
++                [
+                     "-Wl,-rpath=/" + rp
+                     for rp in rpaths
+-                ] + remap_linkopts
+-            }.keys(),
++                ],
++            ),
+             direct_deps = import_targets + [":_so_libs"],
+             deps = deps,
+             strip_include_prefix = None,
+@@ -421,23 +448,26 @@
+             deps = deps,
+             additional_compiler_inputs = hpp_files_woext,
+             additional_linker_inputs = so_files + o_files,
+-            linkopts = [
+-                # Required for linker to find .so libraries
+-                "-L$(BINDIR)/external/{}/{}".format(rctx.attr.name, rp)
+-                for rp in rpaths
+-            ] + [
+-                # # Required for bazel test binary to find its dependencies.
+-                # "-Wl,-rpath=../{}/{}".format(rctx.attr.name, rp)
+-                # for rp in rpaths
+-            ] + [
+-                # Required for ld to validate rpath entries
+-                "-Wl,-rpath-link=$(BINDIR)/external/{}/{}".format(rctx.attr.name, rp)
+-                for rp in rpaths
+-            ] + [
+-                # Required for containers to find the dependencies at runtime.
+-                "-Wl,-rpath=/" + rp
+-                for rp in rpaths
+-            ] + remap_linkopts,
++            linkopts = render_linkopts(
++                [
++                    # Required for linker to find .so libraries
++                    "-L$(BINDIR)/external/{}/{}".format(rctx.attr.name, rp)
++                    for rp in rpaths
++                ] + [
++                    # # Required for bazel test binary to find its dependencies.
++                    # "-Wl,-rpath=../{}/{}".format(rctx.attr.name, rp)
++                    # for rp in rpaths
++                ] + [
++                    # Required for ld to validate rpath entries
++                    "-Wl,-rpath-link=$(BINDIR)/external/{}/{}".format(rctx.attr.name, rp)
++                    for rp in rpaths
++                ] + remap_linkopts,
++                [
++                    # Required for containers to find the dependencies at runtime.
++                    "-Wl,-rpath=/" + rp
++                    for rp in rpaths
++                ],
++            ),
+             direct_deps = [":_so_libs"],
+         )
+ 
+diff -ruN rd-pristine/apt/private/pkgconfig.bzl rules_distroless-01bb79d7eef4eb3ce9511d3dfaf0ab386bd8d12d/apt/private/pkgconfig.bzl
+--- a/apt/private/pkgconfig.bzl	2026-07-29 19:08:26.000000000 +0100
++++ b/apt/private/pkgconfig.bzl	2026-09-08 14:56:30.719303228 +0100
+@@ -79,6 +79,9 @@
+     if "libdir" in variables:
+         libdir = _trim(variables["libdir"])
+     linkopts = []
++
++    # Kept apart from `linkopts` so the caller can put them behind a select.
++    rpath_linkopts = []
+     includes = []
+     link_paths = []
+     defines = []
+@@ -103,7 +106,7 @@
+                 if not linkpath:
+                     continue
+                 link_paths.append(linkpath)
+-                linkopts.append("-Wl,-rpath=" + arg.removeprefix("-L"))
++                rpath_linkopts.append("-Wl,-rpath=" + linkpath)
+                 continue
+             elif arg.startswith("-l"):
+                 libnames.append("lib" + arg.removeprefix("-l"))
+@@ -150,17 +153,18 @@
+             "/usr/include",
+         ]
+ 
+-    return (libnames, includedir, libdir, linkopts, link_paths, includes, defines)
++    return (libnames, includedir, libdir, linkopts, rpath_linkopts, link_paths, includes, defines)
+ 
+ def pkgconfig(rctx, path):
+     pc = parse_pc(rctx.read(path))
+-    (libnames, includedir, libdir, linkopts, link_paths, includes, defines) = process_pcconfig(pc)
++    (libnames, includedir, libdir, linkopts, rpath_linkopts, link_paths, includes, defines) = process_pcconfig(pc)
+ 
+     return struct(
+         libnames = libnames,
+         includedir = includedir,
+         libdir = libdir,
+         linkopts = linkopts,
++        rpath_linkopts = rpath_linkopts,
+         link_paths = link_paths,
+         includes = includes,
+         defines = defines,
